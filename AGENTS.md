@@ -1,4 +1,102 @@
-# xterm.js Copilot Instructions
+# xterm.js Agent Instructions
+
+## MemPalace-First Memory
+
+Use MemPalace as the primary durable memory store across sessions.
+
+- Canonical memory store: `/Users/kostia/.mempalace/palace`
+- Reference mirror: `/Users/kostia/Documents/Obsidian Vault`
+- Continuity-only MCP: `memory` server at `/Users/kostia/.codex/memory/knowledge_graph.json`
+
+### Memory Policy
+
+1. MemPalace is the source of truth for durable memory.
+2. Obsidian is reference/mirror context and import source unless explicitly promoted.
+3. `memory` MCP is a thin pointer layer only:
+   - canonical paths
+   - active project wing pointers
+   - selected stable preferences
+4. Do not store detailed durable project history in memory MCP.
+5. Never store secrets or credentials in any memory system.
+6. Memory processing is local-only; do not use external rerank or summarization APIs.
+
+### Runtime Protocol
+
+At the start of each task:
+
+1. Call `mempalace_status`.
+2. Run targeted `mempalace_search` for relevant people, projects, and decisions before making assumptions.
+3. Use existing wings and rooms when possible instead of creating new taxonomy ad hoc.
+
+During a task:
+
+1. Query before claiming historical, person, or project facts.
+2. Save durable updates via structured drawers with required metadata:
+   - `wing`
+   - `room`
+   - `hall`
+   - `source_file`
+   - `timestamp`
+   - `content_type`
+3. Use halls consistently:
+   - `hall_facts`
+   - `hall_events`
+   - `hall_discoveries`
+   - `hall_preferences`
+   - `hall_advice`
+4. Keep entries concise, factual, and traceable to source context.
+
+At checkpoint and task end:
+
+1. Auto-checkpoint every roughly 15 user turns and before compaction.
+2. On task end, save a final durable summary to MemPalace.
+3. Update KG only when relationships or facts changed over time.
+
+### Taxonomy Conventions
+
+- Project wings: `wing_project_<slug>`
+- Person wings: `wing_person_<slug>`
+- Session/runtime wings: `wing_codex_sessions`
+- Stable topic rooms use slugs such as `auth`, `infra`, or `experiments`.
+- Decision rooms are prefixed with `decision-` where applicable.
+
+### Operational Controls
+
+1. Redact secret-like tokens before storing memory.
+2. Skip transient/generated sources such as `node_modules`, `.next`, build outputs, and archives.
+3. Prefer idempotent writes with deterministic IDs where possible.
+4. Keep a retry queue for failed writes and replay it on the next ingest cycle.
+
+## ECC Harness Layer
+
+Use [`affaan-m/ECC`](https://github.com/affaan-m/ECC) as the cross-harness operating layer for Codex work in this repository. ECC is a harness-native agent system for Codex, Claude Code, Cursor, OpenCode, and related tools, with reusable agents, skills, hooks, rules, MCP conventions, and workflow discipline.
+
+### ECC Usage Policy
+
+1. Treat this `AGENTS.md` as the project-local Codex control surface.
+2. Apply ECC principles proactively:
+   - agent-first delegation for complex work
+   - plan before execution for multi-file or high-risk changes
+   - test-driven implementation for bug fixes and new behavior when practical
+   - security-first review before commits or sensitive changes
+   - verification loops using build, lint, unit tests, integration tests, or focused smoke tests
+3. Prefer ECC-style role routing using the available Codex skills/tools:
+   - planning or architecture work: use planner/architect judgment before editing
+   - TypeScript or JavaScript changes: use reviewer mindset after edits
+   - tests: use the xterm.js `unit-test` skill for `.test.ts` files and local test conventions
+   - benchmark work: use the xterm.js `benchmark` skill for `*.benchmark.ts`
+   - browser/UI verification: use Browser or Playwright when a real rendered surface matters
+4. Do not blindly import ECC defaults that conflict with xterm.js conventions. This file's xterm.js-specific build, test, lint, API, and code style rules take precedence.
+5. Do not install, update, or sync ECC assets from the network unless the user explicitly asks for installation or dependency changes.
+6. If ECC guidance is needed beyond this file, consult the upstream repository first and cite the exact upstream source used.
+
+### ECC Quality Bar
+
+- Keep functions and files focused, with readable names and explicit error handling.
+- Validate untrusted inputs at system boundaries.
+- Never hardcode secrets; use environment variables or the repo's existing secret handling.
+- After writing or modifying code, review for correctness, tests, security, and maintainability before finalizing.
+- Capture durable project learnings in MemPalace, and put team/project docs in the repo's existing documentation structure when they belong there.
 
 ## Architecture Overview
 
@@ -21,7 +119,7 @@ npm run build && npm run esbuild # Build all TypeScript and bundle
 
 **Testing**:
 - Unit tests: `npm run test-unit` (Mocha)
-- Unit tests filtering to file: `npm run test-unit -- **/fileName.ts
+- Unit tests filtering to file: `npm run test-unit -- **/fileName.ts`
 - Per-addon unit tests: `npm run test-unit -- addons/addon-image/out-esbuild/*.test.js`
 - Integration tests: `npm run test-integration` (Playwright across Chrome/Firefox/WebKit)
 - Integration tests by file: `npm run test-integration -- test/playwright/InputHandler.test.ts`. Never use grep to filter tests, it doesn't work

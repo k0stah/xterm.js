@@ -1,0 +1,12 @@
+node_modules
+lib
+out
+addons/*/lib
+addons/*/out
+demo/dist
+coverage
+.git
+.vscode
+.idea
+.DS_Store
+npm-debug.log*
