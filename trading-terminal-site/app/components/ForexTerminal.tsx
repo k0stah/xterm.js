@@ -52,6 +52,20 @@ type Tick = {
   spread: string;
 };
 
+type Candle = {
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+};
+
+const ChartSize = {
+  Width: 760,
+  Height: 250,
+  Padding: 16,
+} as const;
+
 const seededQuotes: Record<SymbolName, Quote> = {
   "EUR/USD": seedQuote("EUR/USD", "1.15400", "0.00018"),
   "GBP/USD": seedQuote("GBP/USD", "1.37055", "0.00022"),
@@ -108,8 +122,12 @@ function timeLabel(value: string): string {
   return Number.isNaN(date.getTime()) ? "--:--:--" : date.toISOString().slice(11, 19);
 }
 
-function ageLabel(value: string): string {
-  const ageMs = Date.now() - new Date(value).getTime();
+function ageLabel(value: string, nowMs: number): string {
+  if (!nowMs) {
+    return "waiting";
+  }
+
+  const ageMs = nowMs - new Date(value).getTime();
   if (!Number.isFinite(ageMs) || ageMs < 0) {
     return "waiting";
   }
@@ -119,21 +137,54 @@ function ageLabel(value: string): string {
   return `${Math.floor(ageMs / 1000)}s ago`;
 }
 
-function chartPoints(values: number[]): string {
-  const width = 760;
-  const height = 250;
-  const padding = 16;
-  const min = Math.min(...values);
-  const max = Math.max(...values);
+function createCandles(values: number[]): Candle[] {
+  if (!values.length) {
+    return [];
+  }
+
+  const source = values.length === 1 ? [values[0], values[0]] : values;
+  const bucketSize = Math.max(2, Math.ceil(source.length / 18));
+  const sourceRange = Math.max(...source) - Math.min(...source);
+  const minimumWick = Math.max(source[0] * 0.00002, sourceRange * 0.04);
+  const candles: Candle[] = [];
+
+  for (let index = 0; index < source.length; index += bucketSize) {
+    const bucket = source.slice(index, index + bucketSize);
+    if (!bucket.length) {
+      continue;
+    }
+    const open = bucket[0];
+    const close = bucket[bucket.length - 1];
+    const rawHigh = Math.max(...bucket);
+    const rawLow = Math.min(...bucket);
+    const bodyRange = Math.abs(close - open);
+    const wickPadding = Math.max(minimumWick, bodyRange * 0.45);
+    candles.push({
+      open,
+      high: rawHigh + wickPadding,
+      low: rawLow - wickPadding,
+      close,
+      volume: Math.max(bodyRange, rawHigh - rawLow, minimumWick),
+    });
+  }
+
+  return candles;
+}
+
+function chartY(value: number, min: number, max: number): number {
   const range = max - min || 1;
 
-  return values
-    .map((value, index) => {
-      const x = padding + (index / Math.max(values.length - 1, 1)) * (width - padding * 2);
-      const y = padding + (1 - (value - min) / range) * (height - padding * 2);
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
+  return ChartSize.Padding + (1 - (value - min) / range) * (ChartSize.Height - ChartSize.Padding * 2);
+}
+
+function candleX(index: number, total: number): number {
+  const slotWidth = (ChartSize.Width - ChartSize.Padding * 2) / Math.max(total, 1);
+  return ChartSize.Padding + slotWidth * index + slotWidth / 2;
+}
+
+function candleWidth(total: number): number {
+  const slotWidth = (ChartSize.Width - ChartSize.Padding * 2) / Math.max(total, 1);
+  return Math.max(7, Math.min(24, slotWidth * 0.58));
 }
 
 function createSeedSeries(start: number): number[] {
@@ -181,8 +232,12 @@ export default function ForexTerminal() {
   const [now, setNow] = useState(0);
 
   useEffect(() => {
+    const bootstrapTimer = window.setTimeout(() => setNow(Date.now()), 0);
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearTimeout(bootstrapTimer);
+      window.clearInterval(timer);
+    };
   }, []);
 
   useEffect(() => {
@@ -323,9 +378,10 @@ export default function ForexTerminal() {
   const previousMid = activeSeries.length > 1 ? activeSeries[activeSeries.length - 2] : Number(activePrice.mid);
   const priceChange = Number(activePrice.mid) - previousMid;
   const isUp = priceChange >= 0;
-  const chartPath = useMemo(() => chartPoints(activeSeries), [activeSeries]);
-  const chartMin = Math.min(...activeSeries);
-  const chartMax = Math.max(...activeSeries);
+  const candles = useMemo(() => createCandles(activeSeries), [activeSeries]);
+  const candleChartWidth = candleWidth(candles.length);
+  const chartMin = candles.length ? Math.min(...candles.map((candle) => candle.low)) : Number(activePrice.mid);
+  const chartMax = candles.length ? Math.max(...candles.map((candle) => candle.high)) : Number(activePrice.mid);
   const resolvedStatus =
     status === "live" && now - new Date(activePrice.timestamp).getTime() > 12000 ? "stale" : status;
 
@@ -394,7 +450,7 @@ export default function ForexTerminal() {
                           {formatPrice(symbol, price.bid)} / {formatPrice(symbol, price.ask)}
                         </p>
                         <p className="text-sm text-[var(--muted)]">
-                          Spread {formatPrice(symbol, price.spread)} · {ageLabel(price.timestamp)}
+                          Spread {formatPrice(symbol, price.spread)} · {ageLabel(price.timestamp, now)}
                         </p>
                       </div>
                     </button>
@@ -426,20 +482,51 @@ export default function ForexTerminal() {
                 <div className="chart-shell mt-5">
                   <div className="chart-grid" />
                   <svg
-                    aria-label={`${selectedSymbol} simulated mid-price chart`}
+                    aria-label={`${selectedSymbol} simulated OHLC candle chart`}
                     className="chart-candles"
                     role="img"
-                    viewBox="0 0 760 250"
+                    viewBox={`0 0 ${ChartSize.Width} ${ChartSize.Height}`}
                   >
-                    <polyline className="tick-line-shadow" points={chartPath} />
-                    <polyline className="tick-line" points={chartPath} />
-                    {activeSeries.map((value, index) => {
-                      if (index % 6 !== 0 && index !== activeSeries.length - 1) {
-                        return null;
-                      }
-                      const point = chartPoints(activeSeries.slice(0, index + 1)).split(" ").at(-1);
-                      const [x = "0", y = "0"] = point?.split(",") ?? [];
-                      return <circle className="tick-dot" cx={x} cy={y} key={`${value}-${index}`} r={index === activeSeries.length - 1 ? 5 : 3} />;
+                    {candles.map((candle, index) => {
+                      const x = candleX(index, candles.length);
+                      const openY = chartY(candle.open, chartMin, chartMax);
+                      const closeY = chartY(candle.close, chartMin, chartMax);
+                      const highY = chartY(candle.high, chartMin, chartMax);
+                      const lowY = chartY(candle.low, chartMin, chartMax);
+                      const bodyHeight = Math.max(3, Math.abs(closeY - openY));
+                      const bodyY = Math.min(openY, closeY) - (bodyHeight === 3 ? 1.5 : 0);
+                      const volumeHeight = Math.max(
+                        10,
+                        Math.min(42, (candle.volume / Math.max(chartMax - chartMin, 1)) * 220),
+                      );
+                      const directionClass = candle.close >= candle.open ? "candle-up" : "candle-down";
+                      return (
+                        <g className={directionClass} key={`${candle.open}-${candle.close}-${index}`}>
+                          <rect
+                            className="candle-volume"
+                            height={volumeHeight.toFixed(1)}
+                            rx="2"
+                            width={candleChartWidth.toFixed(1)}
+                            x={(x - candleChartWidth / 2).toFixed(1)}
+                            y={(ChartSize.Height - ChartSize.Padding - volumeHeight).toFixed(1)}
+                          />
+                          <line
+                            className="candle-wick"
+                            x1={x.toFixed(1)}
+                            x2={x.toFixed(1)}
+                            y1={highY.toFixed(1)}
+                            y2={lowY.toFixed(1)}
+                          />
+                          <rect
+                            className="candle-body"
+                            height={bodyHeight.toFixed(1)}
+                            rx="2"
+                            width={candleChartWidth.toFixed(1)}
+                            x={(x - candleChartWidth / 2).toFixed(1)}
+                            y={bodyY.toFixed(1)}
+                          />
+                        </g>
+                      );
                     })}
                   </svg>
                   <div className="chart-label left-4 top-5">{formatPrice(selectedSymbol, chartMax)}</div>
