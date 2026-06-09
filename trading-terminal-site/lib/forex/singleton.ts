@@ -1,8 +1,19 @@
-import { FALLBACK_ANCHORS, parseEcbCsv, type AnchorRate } from "./market.js";
+import {
+  deriveHistoricalPricePoints,
+  FALLBACK_ANCHORS,
+  parseEcbCsv,
+  parseEcbHistoricalCsv,
+  type AnchorRate,
+  type HistoricalPricePoint,
+} from "./market.js";
 import { MarketSimulationEngine } from "./simulation.js";
 
 export const ECB_ENDPOINT =
   "https://data-api.ecb.europa.eu/service/data/EXR/D.USD+GBP+JPY+CHF.EUR.SP00.A?lastNObservations=1&format=csvdata";
+const ECB_HISTORY_ENDPOINT =
+  "https://data-api.ecb.europa.eu/service/data/EXR/D.USD+GBP+JPY+CHF.EUR.SP00.A";
+const DefaultHistoryDays = 45;
+const HistoryCacheSeconds = 6 * 60 * 60;
 
 type AnchorState = {
   anchors: AnchorRate[];
@@ -10,10 +21,24 @@ type AnchorState = {
   lastFailure: string | null;
 };
 
+type HistoryState = {
+  days: number;
+  lastFailure: string | null;
+  retrievedAt: string | null;
+  points: HistoricalPricePoint[];
+};
+
 const state: AnchorState = {
   anchors: FALLBACK_ANCHORS,
   lastRefreshAttemptAt: null,
   lastFailure: null,
+};
+
+const historyState: HistoryState = {
+  days: DefaultHistoryDays,
+  lastFailure: null,
+  points: [],
+  retrievedAt: null,
 };
 
 const engine = new MarketSimulationEngine(state.anchors, {
@@ -30,6 +55,10 @@ export function getMarketEngine(): MarketSimulationEngine {
 
 export function getAnchorState(): AnchorState {
   return state;
+}
+
+export function getHistoryState(): HistoryState {
+  return historyState;
 }
 
 export async function refreshEcbAnchors(fetcher: typeof fetch = fetch): Promise<AnchorRate[]> {
@@ -56,4 +85,55 @@ export async function refreshEcbAnchors(fetcher: typeof fetch = fetch): Promise<
     });
     return state.anchors;
   }
+}
+
+export async function getHistoricalPrices(
+  days = DefaultHistoryDays,
+  fetcher: typeof fetch = fetch,
+): Promise<HistoricalPricePoint[]> {
+  const boundedDays = Math.max(31, Math.min(120, Math.floor(days)));
+  if (
+    historyState.points.length &&
+    historyState.days >= boundedDays &&
+    historyState.retrievedAt &&
+    Date.now() - new Date(historyState.retrievedAt).getTime() < HistoryCacheSeconds * 1000
+  ) {
+    return historyState.points;
+  }
+
+  const now = new Date();
+  const endPeriod = dateOnly(now);
+  const startPeriod = dateOnly(new Date(now.getTime() - boundedDays * 24 * 60 * 60 * 1000));
+  const url = new URL(process.env.ECB_HISTORY_API_BASE_URL ?? ECB_HISTORY_ENDPOINT);
+  url.searchParams.set("startPeriod", startPeriod);
+  url.searchParams.set("endPeriod", endPeriod);
+  url.searchParams.set("format", "csvdata");
+
+  try {
+    const response = await fetcher(url.toString(), {
+      headers: { Accept: "text/csv,*/*" },
+    });
+    if (!response.ok) {
+      throw new Error(`ECB historical data returned HTTP ${response.status}.`);
+    }
+
+    const text = await response.text();
+    const retrievedAt = new Date().toISOString();
+    const points = deriveHistoricalPricePoints(parseEcbHistoricalCsv(text, retrievedAt));
+    historyState.days = boundedDays;
+    historyState.lastFailure = null;
+    historyState.points = points;
+    historyState.retrievedAt = retrievedAt;
+    return points;
+  } catch (error) {
+    historyState.lastFailure = error instanceof Error ? error.message : "ECB historical data refresh failed.";
+    console.warn("forex.ecb_history_refresh_failed", {
+      message: historyState.lastFailure,
+    });
+    return historyState.points;
+  }
+}
+
+function dateOnly(date: Date): string {
+  return date.toISOString().slice(0, 10);
 }

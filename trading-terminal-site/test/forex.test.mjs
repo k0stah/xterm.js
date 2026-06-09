@@ -3,10 +3,13 @@ import test from "node:test";
 
 import {
   deriveInstruments,
+  deriveHistoricalPricePoints,
   parseEcbCsv,
+  parseEcbHistoricalCsv,
 } from "../.tmp-test/market.js";
 import {
   aggregateCandlesForInterval,
+  appendLivePricePoint,
   marketRangeForWindow,
 } from "../.tmp-test/chart.js";
 import { MarketSimulationEngine } from "../.tmp-test/simulation.js";
@@ -116,6 +119,55 @@ test("24h market range includes the current displayed price", () => {
 
   assert.equal(range.high, 1.4);
   assert.equal(range.low, 1.0);
+});
+
+test("live price history replaces synthetic seed points", () => {
+  const history = appendLivePricePoint(
+    [
+      { synthetic: true, timestamp: "2026-06-09T11:58:00.000Z", value: 1.153 },
+      { synthetic: true, timestamp: "2026-06-09T11:59:00.000Z", value: 1.154 },
+    ],
+    { timestamp: "2026-06-09T12:00:00.000Z", value: 1.159 },
+    100,
+  );
+
+  assert.deepEqual(history, [
+    { source: "live", timestamp: "2026-06-09T12:00:00.000Z", value: 1.159 },
+  ]);
+});
+
+test("derives one month chart points from ECB historical observations", () => {
+  const historicalCsv = `KEY,FREQ,CURRENCY,CURRENCY_DENOM,EXR_TYPE,EXR_SUFFIX,TIME_PERIOD,OBS_VALUE
+EXR.D.USD.EUR.SP00.A,D,USD,EUR,SP00,A,2026-05-08,1.125
+EXR.D.GBP.EUR.SP00.A,D,GBP,EUR,SP00,A,2026-05-08,0.845
+EXR.D.JPY.EUR.SP00.A,D,JPY,EUR,SP00,A,2026-05-08,162.5
+EXR.D.CHF.EUR.SP00.A,D,CHF,EUR,SP00,A,2026-05-08,0.930
+EXR.D.USD.EUR.SP00.A,D,USD,EUR,SP00,A,2026-06-09,1.154
+EXR.D.GBP.EUR.SP00.A,D,GBP,EUR,SP00,A,2026-06-09,0.842
+EXR.D.JPY.EUR.SP00.A,D,JPY,EUR,SP00,A,2026-06-09,166.2
+EXR.D.CHF.EUR.SP00.A,D,CHF,EUR,SP00,A,2026-06-09,0.936
+`;
+
+  const points = deriveHistoricalPricePoints(parseEcbHistoricalCsv(historicalCsv, "2026-06-09T12:00:00.000Z"));
+  assert.equal(points.length, 12);
+  assert.deepEqual(
+    points
+      .filter((point) => point.symbol === "EUR/USD")
+      .map((point) => [point.timestamp, point.mid, point.source]),
+    [
+      ["2026-05-08T00:00:00.000Z", "1.12500000", "ECB"],
+      ["2026-06-09T00:00:00.000Z", "1.15400000", "ECB"],
+    ],
+  );
+  assert.deepEqual(
+    points
+      .filter((point) => point.symbol === "USD/JPY")
+      .map((point) => [point.timestamp, point.mid]),
+    [
+      ["2026-05-08T00:00:00.000Z", "144.44444444"],
+      ["2026-06-09T00:00:00.000Z", "144.02079722"],
+    ],
+  );
 });
 
 test("buy orders execute at ask and reduce cash", () => {

@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
+  appendLivePricePoint,
   aggregateCandlesForInterval,
   CHART_INTERVALS,
   type ChartInterval,
@@ -59,6 +60,14 @@ type Tick = {
   spread: string;
 };
 
+type HistoricalPayloadPoint = {
+  symbol: SymbolName;
+  timestamp: string;
+  mid: string;
+  source: "ECB";
+  anchor_date: string;
+};
+
 const ChartSize = {
   Width: 760,
   Height: 250,
@@ -75,8 +84,8 @@ const chartIntervalCandles: Record<ChartInterval, number> = {
   "30min": 14,
   "1h": 11,
   "6h": 8,
-  "1d": 6,
-  "1w": 4,
+  "1d": 31,
+  "1w": 8,
 };
 
 const seededQuotes: Record<SymbolName, Quote> = {
@@ -166,35 +175,6 @@ function candleWidth(total: number): number {
   return Math.max(7, Math.min(24, slotWidth * 0.58));
 }
 
-function createSeedSeries(start: number): PricePoint[] {
-  const anchorMs = Date.parse("2026-06-09T12:00:00.000Z");
-  const offsets = new Set<number>();
-
-  for (let day = 7; day >= 0; day -= 1) {
-    for (const hour of [18, 12, 6, 0]) {
-      offsets.add(day * 24 * 60 * 60 * 1000 + hour * 60 * 60 * 1000);
-    }
-  }
-  for (let hour = 24; hour >= 0; hour -= 1) {
-    offsets.add(hour * 60 * 60 * 1000);
-  }
-  for (let minute = 95; minute >= 0; minute -= 1) {
-    offsets.add(minute * 60 * 1000);
-  }
-
-  return Array.from(offsets)
-    .map((offset, index) => {
-      const phase = index / 2.7;
-      const drift = Math.sin(phase) * start * 0.00032;
-      const pulse = Math.cos(phase / 2.1) * start * 0.00018;
-      return {
-        timestamp: new Date(anchorMs - offset).toISOString(),
-        value: start + drift + pulse,
-      };
-    })
-    .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
-}
-
 function statusLabel(status: FeedStatus): string {
   switch (status) {
     case "live":
@@ -213,15 +193,14 @@ export default function ForexTerminal() {
   const [selectedInterval, setSelectedInterval] = useState<ChartInterval>("5min");
   const [prices, setPrices] = useState<Record<SymbolName, Quote>>(seededQuotes);
   const [series, setSeries] = useState<Record<SymbolName, PricePoint[]>>(() =>
-    Object.fromEntries(
-      SYMBOLS.map((symbol) => [symbol, createSeedSeries(Number(seededQuotes[symbol].mid))]),
-    ) as Record<SymbolName, PricePoint[]>,
+    Object.fromEntries(SYMBOLS.map((symbol) => [symbol, []])) as Record<SymbolName, PricePoint[]>,
   );
   const [ticks, setTicks] = useState<Tick[]>([]);
   const [status, setStatus] = useState<FeedStatus>("connecting");
   const [statusMessage, setStatusMessage] = useState("Connecting to simulated real-time feed.");
   const [quantity, setQuantity] = useState("1000");
   const [orderMessage, setOrderMessage] = useState("");
+  const [historyMessage, setHistoryMessage] = useState("Loading ECB daily history.");
   const [account, setAccount] = useState<AccountSummary>({
     cashBalanceUsd: "100000.00000000",
     equityUsd: "100000.00000000",
@@ -294,6 +273,65 @@ export default function ForexTerminal() {
     void refreshAccount();
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadHistory(): Promise<void> {
+      try {
+        const response = await fetch(
+          `/api/v1/forex/history?symbols=${encodeURIComponent(SYMBOLS.join(","))}&days=45`,
+          { cache: "no-store" },
+        );
+        if (!response.ok) {
+          throw new Error(`History API returned HTTP ${response.status}.`);
+        }
+        const payload = (await response.json()) as {
+          data: HistoricalPayloadPoint[];
+          failure?: string | null;
+        };
+        if (cancelled) {
+          return;
+        }
+
+        const historyBySymbol = Object.fromEntries(SYMBOLS.map((symbol) => [symbol, []])) as Record<SymbolName, PricePoint[]>;
+        for (const point of payload.data) {
+          const value = Number(point.mid);
+          if (!Number.isFinite(value)) {
+            continue;
+          }
+          historyBySymbol[point.symbol].push({
+            source: "ecb",
+            timestamp: point.timestamp,
+            value,
+          });
+        }
+
+        setSeries((currentSeries) => {
+          const next = { ...currentSeries };
+          for (const symbol of SYMBOLS) {
+            const livePoints = (currentSeries[symbol] ?? []).filter((point) => point.source !== "ecb");
+            next[symbol] = [...historyBySymbol[symbol], ...livePoints].slice(-MaxHistoryPoints);
+          }
+          return next;
+        });
+        setHistoryMessage(
+          payload.failure
+            ? `ECB daily history unavailable: ${payload.failure}`
+            : "ECB daily history loaded for the last month.",
+        );
+      } catch (error) {
+        if (!cancelled) {
+          setHistoryMessage(error instanceof Error ? error.message : "ECB daily history unavailable.");
+        }
+      }
+    }
+
+    void loadHistory();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   function mergeQuotes(quotes: Quote[]): void {
     setPrices((current) => {
       const next = { ...current };
@@ -314,10 +352,11 @@ export default function ForexTerminal() {
         ].slice(0, 10));
         setSeries((currentSeries) => ({
           ...currentSeries,
-          [quote.symbol]: [
-            ...(currentSeries[quote.symbol] ?? []),
+          [quote.symbol]: appendLivePricePoint(
+            currentSeries[quote.symbol] ?? [],
             { timestamp: quote.timestamp, value: mid },
-          ].slice(-MaxHistoryPoints),
+            MaxHistoryPoints,
+          ),
         }));
       }
       return next;
@@ -388,12 +427,20 @@ export default function ForexTerminal() {
     () => series[selectedSymbol] ?? [],
     [selectedSymbol, series],
   );
-  const previousMid = activeHistory.length > 1 ? activeHistory[activeHistory.length - 2].value : Number(activePrice.mid);
+  const activeLiveHistory = useMemo(
+    () => activeHistory.filter((point) => point.source !== "ecb"),
+    [activeHistory],
+  );
+  const activeChartHistory = useMemo(
+    () => selectedInterval === "1d" || selectedInterval === "1w" ? activeHistory : activeLiveHistory,
+    [activeHistory, activeLiveHistory, selectedInterval],
+  );
+  const previousMid = activeLiveHistory.length > 1 ? activeLiveHistory[activeLiveHistory.length - 2].value : Number(activePrice.mid);
   const priceChange = Number(activePrice.mid) - previousMid;
   const isUp = priceChange >= 0;
   const candles = useMemo(
-    () => aggregateCandlesForInterval(activeHistory, selectedInterval, chartIntervalCandles[selectedInterval]),
-    [activeHistory, selectedInterval],
+    () => aggregateCandlesForInterval(activeChartHistory, selectedInterval, chartIntervalCandles[selectedInterval]),
+    [activeChartHistory, selectedInterval],
   );
   const candleChartWidth = candleWidth(candles.length);
   const latestPricePoint = useMemo(
@@ -468,8 +515,8 @@ export default function ForexTerminal() {
           <section aria-label="Market ticker" className="ticker-strip">
             {SYMBOLS.map((symbol) => {
               const price = prices[symbol];
-              const seriesForSymbol = series[symbol] ?? [];
-              const prior = seriesForSymbol.length > 1 ? seriesForSymbol[seriesForSymbol.length - 2].value : Number(price.mid);
+              const liveSeriesForSymbol = (series[symbol] ?? []).filter((point) => point.source !== "ecb");
+              const prior = liveSeriesForSymbol.length > 1 ? liveSeriesForSymbol[liveSeriesForSymbol.length - 2].value : Number(price.mid);
               const directionUp = Number(price.mid) >= prior;
               return (
                 <button
@@ -505,6 +552,10 @@ export default function ForexTerminal() {
             </section>
           )}
 
+          <section className="terminal-panel px-3 py-2 text-xs font-semibold text-[var(--muted)]">
+            {historyMessage}
+          </section>
+
           <section className="grid items-start gap-2 xl:grid-cols-[278px_minmax(0,1fr)_356px]">
             <aside className="terminal-panel overflow-hidden">
               <div className="panel-heading">
@@ -519,8 +570,8 @@ export default function ForexTerminal() {
               <div className="divide-y divide-[var(--line)]">
                 {SYMBOLS.map((symbol) => {
                   const price = prices[symbol];
-                  const seriesForSymbol = series[symbol] ?? [];
-                  const prior = seriesForSymbol.length > 1 ? seriesForSymbol[seriesForSymbol.length - 2].value : Number(price.mid);
+                  const liveSeriesForSymbol = (series[symbol] ?? []).filter((point) => point.source !== "ecb");
+                  const prior = liveSeriesForSymbol.length > 1 ? liveSeriesForSymbol[liveSeriesForSymbol.length - 2].value : Number(price.mid);
                   const directionUp = Number(price.mid) >= prior;
                   return (
                     <button

@@ -53,6 +53,14 @@ export type Quote = {
   anchorStale: boolean;
 };
 
+export type HistoricalPricePoint = {
+  symbol: ForexSymbol;
+  timestamp: string;
+  mid: DecimalString;
+  source: "ECB";
+  anchorDate: string;
+};
+
 export type MarketStatus = {
   simulatorStatus: "running" | "degraded";
   latestTickTimestamp: string | null;
@@ -166,6 +174,53 @@ export function parseEcbCsv(csv: string, retrievedAt = new Date().toISOString())
   return parsed as AnchorRate[];
 }
 
+export function parseEcbHistoricalCsv(csv: string, retrievedAt = new Date().toISOString()): AnchorRate[] {
+  const lines = csv
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length < 2) {
+    throw new Error("ECB historical response did not contain data rows.");
+  }
+
+  const headers = splitCsvLine(lines[0]).map((header) => header.toUpperCase());
+  const currencyIndex = headers.indexOf("CURRENCY");
+  const valueIndex = headers.indexOf("OBS_VALUE");
+  const dateIndex = headers.indexOf("TIME_PERIOD");
+  if (currencyIndex < 0 || valueIndex < 0 || dateIndex < 0) {
+    throw new Error("ECB historical response is missing CURRENCY, TIME_PERIOD, or OBS_VALUE columns.");
+  }
+
+  const rates: AnchorRate[] = [];
+  for (const line of lines.slice(1)) {
+    const cells = splitCsvLine(line);
+    const currency = cells[currencyIndex]?.toUpperCase() as AnchorCurrency | undefined;
+    const rawRate = cells[valueIndex];
+    const observationDate = cells[dateIndex];
+    if (!currency || !REQUIRED_CURRENCIES.includes(currency) || !rawRate || !observationDate) {
+      continue;
+    }
+
+    try {
+      const rate = toDecimal(rawRate, 8);
+      if (!isPositiveDecimal(rate)) {
+        continue;
+      }
+      rates.push({
+        currency,
+        observationDate,
+        rate,
+        retrievedAt,
+        source: "ECB",
+      });
+    } catch {
+      continue;
+    }
+  }
+
+  return rates;
+}
+
 function splitCsvLine(line: string): string[] {
   const cells: string[] = [];
   let current = "";
@@ -223,6 +278,35 @@ export function deriveInstruments(anchors: AnchorRate[]): DerivedInstrument[] {
       quoteConvention,
     };
   });
+}
+
+export function deriveHistoricalPricePoints(anchors: AnchorRate[]): HistoricalPricePoint[] {
+  const byDate = new Map<string, AnchorRate[]>();
+  for (const anchor of anchors) {
+    const dailyAnchors = byDate.get(anchor.observationDate) ?? [];
+    dailyAnchors.push(anchor);
+    byDate.set(anchor.observationDate, dailyAnchors);
+  }
+
+  const points: HistoricalPricePoint[] = [];
+  for (const [observationDate, dailyAnchors] of [...byDate.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    const currencies = new Set(dailyAnchors.map((anchor) => anchor.currency));
+    if (REQUIRED_CURRENCIES.some((currency) => !currencies.has(currency))) {
+      continue;
+    }
+
+    for (const instrument of deriveInstruments(dailyAnchors)) {
+      points.push({
+        anchorDate: observationDate,
+        mid: instrument.anchorMid,
+        source: "ECB",
+        symbol: instrument.symbol,
+        timestamp: `${observationDate}T00:00:00.000Z`,
+      });
+    }
+  }
+
+  return points;
 }
 
 export function convertQuoteAmountToUsd(

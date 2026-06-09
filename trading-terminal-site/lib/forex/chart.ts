@@ -3,6 +3,8 @@ export const CHART_INTERVALS = ["1min", "5min", "10min", "30min", "1h", "6h", "1
 export type ChartInterval = (typeof CHART_INTERVALS)[number];
 
 export type PricePoint = {
+  source?: "ecb" | "live";
+  synthetic?: boolean;
   timestamp: string;
   value: number;
 };
@@ -34,6 +36,21 @@ const chartIntervalMs: Record<ChartInterval, number> = {
 
 export function intervalMs(interval: ChartInterval): number {
   return chartIntervalMs[interval];
+}
+
+export function appendLivePricePoint(
+  points: PricePoint[],
+  point: PricePoint,
+  maxPoints: number,
+): PricePoint[] {
+  return [
+    ...points.filter((existingPoint) => !existingPoint.synthetic),
+    {
+      source: "live" as const,
+      timestamp: point.timestamp,
+      value: point.value,
+    },
+  ].slice(-maxPoints);
 }
 
 export function aggregateCandlesForInterval(
