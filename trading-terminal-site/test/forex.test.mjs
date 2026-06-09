@@ -5,6 +5,10 @@ import {
   deriveInstruments,
   parseEcbCsv,
 } from "../.tmp-test/market.js";
+import {
+  aggregateCandlesForInterval,
+  marketRangeForWindow,
+} from "../.tmp-test/chart.js";
 import { MarketSimulationEngine } from "../.tmp-test/simulation.js";
 import {
   executeMarketOrder,
@@ -71,6 +75,47 @@ test("simulation is deterministic for a fixed seed and preserves bid/mid/ask inv
     assert.ok(Number(quote.mid) < Number(quote.ask));
     assert.ok(Number(quote.spread) > 0);
   }
+});
+
+test("aggregates price history into true interval OHLC candles", () => {
+  const candles = aggregateCandlesForInterval(
+    [
+      { timestamp: "2026-06-09T12:00:05.000Z", value: 1.1 },
+      { timestamp: "2026-06-09T12:00:30.000Z", value: 1.3 },
+      { timestamp: "2026-06-09T12:00:55.000Z", value: 1.0 },
+      { timestamp: "2026-06-09T12:01:02.000Z", value: 1.2 },
+    ],
+    "1min",
+    10,
+  );
+
+  assert.equal(candles.length, 2);
+  assert.deepEqual(
+    candles.map((candle) => ({
+      close: candle.close,
+      high: candle.high,
+      low: candle.low,
+      open: candle.open,
+    })),
+    [
+      { close: 1.0, high: 1.3, low: 1.0, open: 1.1 },
+      { close: 1.2, high: 1.2, low: 1.2, open: 1.2 },
+    ],
+  );
+});
+
+test("24h market range includes the current displayed price", () => {
+  const range = marketRangeForWindow(
+    [
+      { timestamp: "2026-06-09T11:30:00.000Z", value: 1.4 },
+      { timestamp: "2026-06-08T11:59:59.000Z", value: 0.5 },
+    ],
+    { timestamp: "2026-06-09T12:00:00.000Z", value: 1.0 },
+    24 * 60 * 60 * 1000,
+  );
+
+  assert.equal(range.high, 1.4);
+  assert.equal(range.low, 1.0);
 });
 
 test("buy orders execute at ask and reduce cash", () => {

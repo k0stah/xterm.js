@@ -29,6 +29,7 @@ const compile = spawnSync(
     "--noEmit",
     "false",
     "lib/forex/decimal.ts",
+    "lib/forex/chart.ts",
     "lib/forex/market.ts",
     "lib/forex/simulation.ts",
     "lib/forex/portfolio.ts",

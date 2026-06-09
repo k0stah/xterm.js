@@ -1,6 +1,13 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import {
+  aggregateCandlesForInterval,
+  CHART_INTERVALS,
+  type ChartInterval,
+  type PricePoint,
+  marketRangeForWindow,
+} from "../../lib/forex/chart";
 
 const SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "EUR/GBP", "EUR/JPY"] as const;
 type SymbolName = (typeof SYMBOLS)[number];
@@ -52,19 +59,25 @@ type Tick = {
   spread: string;
 };
 
-type Candle = {
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-};
-
 const ChartSize = {
   Width: 760,
   Height: 250,
   Padding: 16,
 } as const;
+
+const MaxHistoryPoints = 540;
+const MarketStatsWindowMs = 24 * 60 * 60 * 1000;
+
+const chartIntervalCandles: Record<ChartInterval, number> = {
+  "1min": 28,
+  "5min": 22,
+  "10min": 18,
+  "30min": 14,
+  "1h": 11,
+  "6h": 8,
+  "1d": 6,
+  "1w": 4,
+};
 
 const seededQuotes: Record<SymbolName, Quote> = {
   "EUR/USD": seedQuote("EUR/USD", "1.15400", "0.00018"),
@@ -137,40 +150,6 @@ function ageLabel(value: string, nowMs: number): string {
   return `${Math.floor(ageMs / 1000)}s ago`;
 }
 
-function createCandles(values: number[]): Candle[] {
-  if (!values.length) {
-    return [];
-  }
-
-  const source = values.length === 1 ? [values[0], values[0]] : values;
-  const bucketSize = Math.max(2, Math.ceil(source.length / 18));
-  const sourceRange = Math.max(...source) - Math.min(...source);
-  const minimumWick = Math.max(source[0] * 0.00002, sourceRange * 0.04);
-  const candles: Candle[] = [];
-
-  for (let index = 0; index < source.length; index += bucketSize) {
-    const bucket = source.slice(index, index + bucketSize);
-    if (!bucket.length) {
-      continue;
-    }
-    const open = bucket[0];
-    const close = bucket[bucket.length - 1];
-    const rawHigh = Math.max(...bucket);
-    const rawLow = Math.min(...bucket);
-    const bodyRange = Math.abs(close - open);
-    const wickPadding = Math.max(minimumWick, bodyRange * 0.45);
-    candles.push({
-      open,
-      high: rawHigh + wickPadding,
-      low: rawLow - wickPadding,
-      close,
-      volume: Math.max(bodyRange, rawHigh - rawLow, minimumWick),
-    });
-  }
-
-  return candles;
-}
-
 function chartY(value: number, min: number, max: number): number {
   const range = max - min || 1;
 
@@ -187,12 +166,33 @@ function candleWidth(total: number): number {
   return Math.max(7, Math.min(24, slotWidth * 0.58));
 }
 
-function createSeedSeries(start: number): number[] {
-  return Array.from({ length: 28 }, (_, index) => {
-    const drift = Math.sin(index / 3) * start * 0.00025;
-    const pulse = Math.cos(index / 5) * start * 0.00012;
-    return start + drift + pulse;
-  });
+function createSeedSeries(start: number): PricePoint[] {
+  const anchorMs = Date.parse("2026-06-09T12:00:00.000Z");
+  const offsets = new Set<number>();
+
+  for (let day = 7; day >= 0; day -= 1) {
+    for (const hour of [18, 12, 6, 0]) {
+      offsets.add(day * 24 * 60 * 60 * 1000 + hour * 60 * 60 * 1000);
+    }
+  }
+  for (let hour = 24; hour >= 0; hour -= 1) {
+    offsets.add(hour * 60 * 60 * 1000);
+  }
+  for (let minute = 95; minute >= 0; minute -= 1) {
+    offsets.add(minute * 60 * 1000);
+  }
+
+  return Array.from(offsets)
+    .map((offset, index) => {
+      const phase = index / 2.7;
+      const drift = Math.sin(phase) * start * 0.00032;
+      const pulse = Math.cos(phase / 2.1) * start * 0.00018;
+      return {
+        timestamp: new Date(anchorMs - offset).toISOString(),
+        value: start + drift + pulse,
+      };
+    })
+    .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
 }
 
 function statusLabel(status: FeedStatus): string {
@@ -210,11 +210,12 @@ function statusLabel(status: FeedStatus): string {
 
 export default function ForexTerminal() {
   const [selectedSymbol, setSelectedSymbol] = useState<SymbolName>("EUR/USD");
+  const [selectedInterval, setSelectedInterval] = useState<ChartInterval>("5min");
   const [prices, setPrices] = useState<Record<SymbolName, Quote>>(seededQuotes);
-  const [series, setSeries] = useState<Record<SymbolName, number[]>>(() =>
+  const [series, setSeries] = useState<Record<SymbolName, PricePoint[]>>(() =>
     Object.fromEntries(
       SYMBOLS.map((symbol) => [symbol, createSeedSeries(Number(seededQuotes[symbol].mid))]),
-    ) as Record<SymbolName, number[]>,
+    ) as Record<SymbolName, PricePoint[]>,
   );
   const [ticks, setTicks] = useState<Tick[]>([]);
   const [status, setStatus] = useState<FeedStatus>("connecting");
@@ -313,7 +314,10 @@ export default function ForexTerminal() {
         ].slice(0, 10));
         setSeries((currentSeries) => ({
           ...currentSeries,
-          [quote.symbol]: [...(currentSeries[quote.symbol] ?? []), mid].slice(-48),
+          [quote.symbol]: [
+            ...(currentSeries[quote.symbol] ?? []),
+            { timestamp: quote.timestamp, value: mid },
+          ].slice(-MaxHistoryPoints),
         }));
       }
       return next;
@@ -345,92 +349,178 @@ export default function ForexTerminal() {
 
   async function submitOrder(side: "buy" | "sell"): Promise<void> {
     setOrderMessage("Submitting simulated market order.");
-    const response = await fetch("/api/v1/orders", {
-      body: JSON.stringify({
-        symbol: selectedSymbol,
-        side,
-        quantity,
-        order_type: "market",
-        client_order_id: crypto.randomUUID(),
-      }),
-      headers: { "Content-Type": "application/json" },
-      method: "POST",
-    });
-    const payload = await response.json();
-    if (!response.ok) {
-      setOrderMessage(payload.message ?? "Order rejected.");
-      return;
+    try {
+      const response = await fetch("/api/v1/orders", {
+        body: JSON.stringify({
+          symbol: selectedSymbol,
+          side,
+          quantity,
+          order_type: "market",
+          client_order_id: crypto.randomUUID(),
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      let payload: { execution_price?: string; message?: string } = {};
+      try {
+        payload = (await response.json()) as { execution_price?: string; message?: string };
+      } catch {
+        payload = {};
+      }
+      if (!response.ok || !payload.execution_price) {
+        setOrderMessage(payload.message ?? "Order rejected by the simulator.");
+        return;
+      }
+      setOrderMessage(
+        `${side === "buy" ? "Bought" : "Sold"} ${formatQuantity(quantity)} ${selectedSymbol} at ${formatPrice(
+          selectedSymbol,
+          payload.execution_price,
+        )}.`,
+      );
+      await refreshAccount();
+    } catch {
+      setOrderMessage("Order API unavailable. Try again after the simulator reconnects.");
     }
-    setOrderMessage(
-      `${side === "buy" ? "Bought" : "Sold"} ${formatQuantity(quantity)} ${selectedSymbol} at ${formatPrice(
-        selectedSymbol,
-        payload.execution_price,
-      )}.`,
-    );
-    await refreshAccount();
   }
 
   const activePrice = prices[selectedSymbol];
-  const activeSeries = useMemo(
+  const activeHistory = useMemo(
     () => series[selectedSymbol] ?? [],
     [selectedSymbol, series],
   );
-  const previousMid = activeSeries.length > 1 ? activeSeries[activeSeries.length - 2] : Number(activePrice.mid);
+  const previousMid = activeHistory.length > 1 ? activeHistory[activeHistory.length - 2].value : Number(activePrice.mid);
   const priceChange = Number(activePrice.mid) - previousMid;
   const isUp = priceChange >= 0;
-  const candles = useMemo(() => createCandles(activeSeries), [activeSeries]);
+  const candles = useMemo(
+    () => aggregateCandlesForInterval(activeHistory, selectedInterval, chartIntervalCandles[selectedInterval]),
+    [activeHistory, selectedInterval],
+  );
   const candleChartWidth = candleWidth(candles.length);
-  const chartMin = candles.length ? Math.min(...candles.map((candle) => candle.low)) : Number(activePrice.mid);
-  const chartMax = candles.length ? Math.max(...candles.map((candle) => candle.high)) : Number(activePrice.mid);
+  const latestPricePoint = useMemo(
+    () => ({
+      timestamp: activePrice.timestamp,
+      value: Number(activePrice.mid),
+    }),
+    [activePrice.mid, activePrice.timestamp],
+  );
+  const marketRange = useMemo(
+    () => marketRangeForWindow(activeHistory, latestPricePoint, MarketStatsWindowMs),
+    [activeHistory, latestPricePoint],
+  );
+  const candleLow = candles.length ? Math.min(...candles.map((candle) => candle.low)) : latestPricePoint.value;
+  const candleHigh = candles.length ? Math.max(...candles.map((candle) => candle.high)) : latestPricePoint.value;
+  const chartPadding = Math.max(latestPricePoint.value * 0.00002, (candleHigh - candleLow) * 0.08);
+  const chartMin = candleLow - chartPadding;
+  const chartMax = candleHigh + chartPadding;
   const resolvedStatus =
     status === "live" && now - new Date(activePrice.timestamp).getTime() > 12000 ? "stale" : status;
+  const askLevels = Array.from({ length: 7 }, (_, index) => {
+    const step = index + 1;
+    const price = Number(activePrice.ask) + Number(activePrice.spread) * step * 0.62;
+    return {
+      price: formatPrice(selectedSymbol, price),
+      size: formatQuantity(Number(quantity || 0) * (1.8 + step * 0.42)),
+      total: formatQuantity(Number(quantity || 0) * (2.4 + step * 0.83)),
+    };
+  }).reverse();
+  const bidLevels = Array.from({ length: 7 }, (_, index) => {
+    const step = index + 1;
+    const price = Number(activePrice.bid) - Number(activePrice.spread) * step * 0.62;
+    return {
+      price: formatPrice(selectedSymbol, price),
+      size: formatQuantity(Number(quantity || 0) * (1.6 + step * 0.38)),
+      total: formatQuantity(Number(quantity || 0) * (2.1 + step * 0.76)),
+    };
+  });
+  const spreadBps = ((Number(activePrice.spread) / Number(activePrice.mid)) * 10000).toFixed(2);
 
   return (
-    <main className="app-scroll bg-[var(--page)] text-[var(--ink)]">
-      <div className="min-h-screen px-4 py-4 sm:px-6 lg:px-8">
-        <div className="mx-auto grid max-w-[1480px] gap-4">
-          <header className="terminal-panel flex flex-wrap items-center justify-between gap-4 px-4 py-3">
+    <main className="app-scroll terminal-shell text-[var(--ink)]">
+      <div className="min-h-screen">
+        <header className="exchange-header">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-3">
-              <div className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-[var(--amber)] text-base font-semibold text-[var(--ink)]">
-                FX
-              </div>
+              <div className="brand-mark">FX</div>
               <div className="min-w-0">
-                <h1 className="truncate text-lg font-semibold">Aster Forex Simulator</h1>
-                <p className="truncate text-sm text-[var(--muted)]">
-                  Simulated real-time feed / virtual USD account
+                <h1 className="truncate text-base font-extrabold">Aster Exchange</h1>
+                <p className="truncate text-xs font-semibold text-[var(--muted)]">
+                  ECB-anchored simulated forex terminal
                 </p>
               </div>
             </div>
-            <div className="flex flex-wrap items-center gap-2 text-sm">
+            <nav aria-label="Trading sections" className="top-nav">
+              <span className="active">Markets</span>
+              <span>Spot</span>
+              <span>Derivatives</span>
+              <span>Grid</span>
+              <span>Portfolio</span>
+              <span>Rewards</span>
+            </nav>
+            <div className="flex flex-wrap items-center gap-2">
               <span className={`status-pill status-${resolvedStatus}`}>
                 <span className="connection-dot" />
                 {statusLabel(resolvedStatus)}
               </span>
-              <span className="data-badge">Source of daily reference rates: ECB statistics.</span>
+              <span className="data-badge">Virtual USD account</span>
             </div>
-          </header>
+          </div>
 
-          <section className="terminal-panel px-4 py-3 text-sm text-[var(--muted)]">
-            Simulated market data. Daily reference-rate anchors are based on ECB statistics. Prices shown between daily anchors are generated by the simulator and are not live or tradable market quotations. This product does not provide investment advice.
+          <section aria-label="Market ticker" className="ticker-strip">
+            {SYMBOLS.map((symbol) => {
+              const price = prices[symbol];
+              const seriesForSymbol = series[symbol] ?? [];
+              const prior = seriesForSymbol.length > 1 ? seriesForSymbol[seriesForSymbol.length - 2].value : Number(price.mid);
+              const directionUp = Number(price.mid) >= prior;
+              return (
+                <button
+                  className={`ticker-tile ${symbol === selectedSymbol ? "is-active" : ""}`}
+                  key={symbol}
+                  onClick={() => setSelectedSymbol(symbol)}
+                  type="button"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-xs font-extrabold">{symbol}</span>
+                    <span className={`mono text-xs font-bold ${directionUp ? "price-up" : "price-down"}`}>
+                      {directionUp ? "+" : "-"}
+                      {formatPrice(symbol, Math.abs(Number(price.mid) - prior))}
+                    </span>
+                  </div>
+                  <div className={`mono mt-1 text-sm font-extrabold ${directionUp ? "price-up" : "price-down"}`}>
+                    {formatPrice(symbol, price.mid)}
+                  </div>
+                </button>
+              );
+            })}
+          </section>
+        </header>
+
+        <div className="mx-auto grid max-w-[1640px] gap-2 px-2 py-2">
+          <section className="terminal-panel terminal-notice px-3 py-2 text-xs font-semibold">
+            Simulated market data. Daily reference anchors use ECB statistics; generated ticks are not live or tradable market quotations. This product does not provide investment advice.
           </section>
 
           {resolvedStatus !== "live" && (
-            <section className="terminal-panel px-4 py-3 text-sm text-[var(--muted)]">
+            <section className="terminal-panel px-3 py-2 text-xs font-semibold text-[var(--muted)]">
               {statusMessage}
             </section>
           )}
 
-          <section className="grid gap-4 lg:grid-cols-[300px_minmax(0,1fr)_360px]">
+          <section className="grid items-start gap-2 xl:grid-cols-[278px_minmax(0,1fr)_356px]">
             <aside className="terminal-panel overflow-hidden">
               <div className="panel-heading">
-                <h2>Market watch</h2>
-                <span>Bid / ask</span>
+                <h2>Markets</h2>
+                <span>Bid / Ask</span>
+              </div>
+              <div className="tab-row">
+                <span className="active">Favorites</span>
+                <span>Majors</span>
+                <span>Crosses</span>
               </div>
               <div className="divide-y divide-[var(--line)]">
                 {SYMBOLS.map((symbol) => {
                   const price = prices[symbol];
                   const seriesForSymbol = series[symbol] ?? [];
-                  const prior = seriesForSymbol.length > 1 ? seriesForSymbol[seriesForSymbol.length - 2] : Number(price.mid);
+                  const prior = seriesForSymbol.length > 1 ? seriesForSymbol[seriesForSymbol.length - 2].value : Number(price.mid);
                   const directionUp = Number(price.mid) >= prior;
                   return (
                     <button
@@ -440,16 +530,16 @@ export default function ForexTerminal() {
                       type="button"
                     >
                       <div>
-                        <p className="font-semibold">{symbol}</p>
-                        <p className="text-sm text-[var(--muted)]">
-                          {directionUp ? "Up" : "Down"} · {price.anchor_stale ? "stale anchor" : "ECB anchor"}
+                        <p className="text-sm font-extrabold">{symbol}</p>
+                        <p className="text-xs font-semibold text-[var(--muted)]">
+                          {price.anchor_stale ? "stale anchor" : "ECB anchor"}
                         </p>
                       </div>
                       <div className="text-right">
-                        <p className="font-medium">
+                        <p className={`mono text-sm font-extrabold ${directionUp ? "price-up" : "price-down"}`}>
                           {formatPrice(symbol, price.bid)} / {formatPrice(symbol, price.ask)}
                         </p>
-                        <p className="text-sm text-[var(--muted)]">
+                        <p className="text-xs font-semibold text-[var(--muted)]">
                           Spread {formatPrice(symbol, price.spread)} · {ageLabel(price.timestamp, now)}
                         </p>
                       </div>
@@ -459,27 +549,43 @@ export default function ForexTerminal() {
               </div>
             </aside>
 
-            <section className="grid gap-4">
-              <div className="terminal-panel p-4">
-                <div className="flex flex-wrap items-start justify-between gap-4">
+            <section className="grid gap-2">
+              <div className="terminal-panel p-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
-                    <p className="text-sm text-[var(--muted)]">{selectedSymbol} · Live simulation</p>
+                    <p className="text-xs font-extrabold text-[var(--muted)]">{selectedSymbol} perpetual simulator</p>
                     <div className="mt-1 flex flex-wrap items-end gap-3">
-                      <h2 className="text-3xl font-semibold">
+                      <h2 className={`mono text-4xl font-extrabold ${isUp ? "price-up" : "price-down"}`}>
                         {formatPrice(selectedSymbol, activePrice.mid)}
                       </h2>
-                      <span className={`mb-1 text-sm font-medium ${isUp ? "text-[var(--green)]" : "text-[var(--red)]"}`}>
+                      <span className={`mb-2 mono text-sm font-extrabold ${isUp ? "price-up" : "price-down"}`}>
                         {isUp ? "+" : ""}
                         {formatPrice(selectedSymbol, priceChange)}
                       </span>
                     </div>
                   </div>
-                  <div className="text-right text-sm text-[var(--muted)]">
-                    <p>Anchor date {activePrice.anchor_date}</p>
-                    <p>{activePrice.anchor_source} reference anchor, generated tick {timeLabel(activePrice.timestamp)}</p>
+                  <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-right text-xs font-semibold text-[var(--muted)] sm:grid-cols-4">
+                    <p>24h High <strong className="mono block text-[var(--ink)]">{formatPrice(selectedSymbol, marketRange.high)}</strong></p>
+                    <p>24h Low <strong className="mono block text-[var(--ink)]">{formatPrice(selectedSymbol, marketRange.low)}</strong></p>
+                    <p>Spread <strong className="mono block text-[var(--ink)]">{spreadBps} bps</strong></p>
+                    <p>Tick <strong className="mono block text-[var(--ink)]">{timeLabel(activePrice.timestamp)}</strong></p>
                   </div>
                 </div>
-                <div className="chart-shell mt-5">
+                <div className="interval-row mt-3" aria-label="Chart time intervals">
+                  <span>Time</span>
+                  {CHART_INTERVALS.map((interval) => (
+                    <button
+                      aria-pressed={selectedInterval === interval}
+                      className={selectedInterval === interval ? "is-active" : ""}
+                      key={interval}
+                      onClick={() => setSelectedInterval(interval)}
+                      type="button"
+                    >
+                      {interval}
+                    </button>
+                  ))}
+                </div>
+                <div className="chart-shell mt-2">
                   <div className="chart-grid" />
                   <svg
                     aria-label={`${selectedSymbol} simulated OHLC candle chart`}
@@ -501,7 +607,7 @@ export default function ForexTerminal() {
                       );
                       const directionClass = candle.close >= candle.open ? "candle-up" : "candle-down";
                       return (
-                        <g className={directionClass} key={`${candle.open}-${candle.close}-${index}`}>
+                        <g className={directionClass} key={`${candle.bucket}-${index}`}>
                           <rect
                             className="candle-volume"
                             height={volumeHeight.toFixed(1)}
@@ -534,11 +640,11 @@ export default function ForexTerminal() {
                 </div>
               </div>
 
-              <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_300px]">
+              <div className="grid gap-2 2xl:grid-cols-[minmax(0,1fr)_300px]">
                 <div className="terminal-panel overflow-hidden">
                   <div className="panel-heading">
                     <h2>Open positions</h2>
-                    <span>Executable spread marks</span>
+                    <span>Simulator P/L</span>
                   </div>
                   <div className="responsive-table">
                     <table>
@@ -576,14 +682,14 @@ export default function ForexTerminal() {
                   </div>
                 </div>
 
-                <div className="terminal-panel p-4">
+                <div className="terminal-panel p-3">
                   <div className="panel-heading no-pad">
-                    <h2>Account</h2>
-                    <span>USD cash</span>
+                    <h2>Assets</h2>
+                    <span>USD margin</span>
                   </div>
-                  <p className="mt-5 text-3xl font-semibold">{formatMoney(account.equityUsd)}</p>
-                  <p className="mt-1 text-sm text-[var(--muted)]">Equity includes unrealized simulator P/L.</p>
-                  <div className="mt-5 grid gap-3">
+                  <p className="mono mt-4 text-3xl font-extrabold">{formatMoney(account.equityUsd)}</p>
+                  <p className="mt-1 text-xs font-semibold text-[var(--muted)]">Equity includes unrealized simulator P/L.</p>
+                  <div className="mt-4 grid gap-3">
                     <div className="metric-row">
                       <span>Cash</span>
                       <strong>{formatMoney(account.cashBalanceUsd)}</strong>
@@ -601,13 +707,45 @@ export default function ForexTerminal() {
               </div>
             </section>
 
-            <aside className="grid gap-4">
-              <div className="terminal-panel p-4">
-                <div className="panel-heading no-pad">
-                  <h2>Trading panel</h2>
-                  <span>Market orders</span>
+            <aside className="grid content-start gap-2">
+              <div className="terminal-panel overflow-hidden">
+                <div className="panel-heading">
+                  <h2>Order book</h2>
+                  <span>{selectedSymbol}</span>
                 </div>
-                <label className="field-label mt-5" htmlFor="symbol">
+                <div className="depth-header">
+                  <span>Price</span>
+                  <span>Size</span>
+                  <span>Total</span>
+                </div>
+                <div className="book-table">
+                  {askLevels.map((level) => (
+                    <div className="book-row ask" key={`ask-${level.price}`}>
+                      <span>{level.price}</span>
+                      <span>{level.size}</span>
+                      <span>{level.total}</span>
+                    </div>
+                  ))}
+                  <div className="spread-row">
+                    <strong className={`mono ${isUp ? "price-up" : "price-down"}`}>{formatPrice(selectedSymbol, activePrice.mid)}</strong>
+                    <span>Spread {formatPrice(selectedSymbol, activePrice.spread)} / {spreadBps} bps</span>
+                  </div>
+                  {bidLevels.map((level) => (
+                    <div className="book-row bid" key={`bid-${level.price}`}>
+                      <span>{level.price}</span>
+                      <span>{level.size}</span>
+                      <span>{level.total}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="terminal-panel p-3">
+                <div className="panel-heading no-pad">
+                  <h2>Spot order</h2>
+                  <span>Market</span>
+                </div>
+                <label className="field-label mt-4" htmlFor="symbol">
                   Pair
                 </label>
                 <select
@@ -633,22 +771,22 @@ export default function ForexTerminal() {
                 <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
                   <div className="quote-tile">
                     <span>Sell at bid</span>
-                    <strong>{formatPrice(selectedSymbol, activePrice.bid)}</strong>
+                    <strong className="price-down">{formatPrice(selectedSymbol, activePrice.bid)}</strong>
                   </div>
                   <div className="quote-tile">
                     <span>Buy at ask</span>
-                    <strong>{formatPrice(selectedSymbol, activePrice.ask)}</strong>
+                    <strong className="price-up">{formatPrice(selectedSymbol, activePrice.ask)}</strong>
                   </div>
                 </div>
-                <div className="mt-5 grid grid-cols-2 gap-3">
-                  <button className="rounded-lg bg-[var(--red)] px-4 py-3 font-semibold text-white" onClick={() => void submitOrder("sell")} type="button">
+                <div className="mt-4 grid grid-cols-2 gap-3">
+                  <button className="order-button sell" onClick={() => void submitOrder("sell")} type="button">
                     Sell
                   </button>
-                  <button className="rounded-lg bg-[var(--green)] px-4 py-3 font-semibold text-white" onClick={() => void submitOrder("buy")} type="button">
+                  <button className="order-button buy" onClick={() => void submitOrder("buy")} type="button">
                     Buy
                   </button>
                 </div>
-                {orderMessage && <p className="mt-3 text-sm text-[var(--muted)]">{orderMessage}</p>}
+                {orderMessage && <p className="mt-3 text-xs font-semibold text-[var(--muted)]">{orderMessage}</p>}
               </div>
 
               <div className="terminal-panel overflow-hidden">
@@ -691,6 +829,14 @@ export default function ForexTerminal() {
               </div>
             </aside>
           </section>
+        </div>
+        <div className="mobile-actions">
+          <button className="order-button sell" onClick={() => void submitOrder("sell")} type="button">
+            Sell {selectedSymbol}
+          </button>
+          <button className="order-button buy" onClick={() => void submitOrder("buy")} type="button">
+            Buy {selectedSymbol}
+          </button>
         </div>
       </div>
     </main>
