@@ -1,0 +1,100 @@
+name: Trading Terminal Site CI/CD
+
+on:
+  push:
+    branches: [ "master" ]
+    paths:
+      - "trading-terminal-site/**"
+      - ".github/workflows/trading-terminal-site.yml"
+  pull_request:
+    branches: [ "master" ]
+    paths:
+      - "trading-terminal-site/**"
+      - ".github/workflows/trading-terminal-site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trading-terminal-site-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SITE_PROJECT_ID: appgprj_6a273edca0788191b65b1ab1d1373183
+  PRODUCTION_URL: https://aster-trading-terminal.yope-1704.chatgpt-team.site/
+
+jobs:
+  build:
+    name: Build Sites artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: trading-terminal-site
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Use Node.js 22.x
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: trading-terminal-site/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test FOREX engine
+        run: npm run test:forex
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify Sites artifact
+        run: |
+          test -f dist/server/index.js
+          test -f dist/.openai/hosting.json
+          test -d dist/.openai/drizzle
+
+      - name: Package Sites artifact
+        run: tar -czf "$RUNNER_TEMP/aster-trading-terminal-sites-dist.tgz" -C . dist
+
+      - name: Upload Sites artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: aster-trading-terminal-sites-dist
+          path: ${{ runner.temp }}/aster-trading-terminal-sites-dist.tgz
+          if-no-files-found: error
+          retention-days: 14
+
+  production:
+    name: Production delivery record
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: production
+      url: https://aster-trading-terminal.yope-1704.chatgpt-team.site/
+    steps:
+      - name: Download Sites artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: aster-trading-terminal-sites-dist
+
+      - name: Summarize delivery target
+        run: |
+          {
+            echo "### Aster Trading Terminal"
+            echo
+            echo "- Sites project: \`${SITE_PROJECT_ID}\`"
+            echo "- Production URL: ${PRODUCTION_URL}"
+            echo "- Artifact: \`aster-trading-terminal-sites-dist.tgz\`"
+            echo
+            echo "The artifact is ready for publication through the Sites project deployment flow."
+          } >> "$GITHUB_STEP_SUMMARY"

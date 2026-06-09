@@ -70,6 +70,32 @@ Lint:
 npm run lint
 ```
 
+## CI/CD
+
+GitHub Actions workflow:
+
+```text
+.github/workflows/trading-terminal-site.yml
+```
+
+The workflow runs on changes to `trading-terminal-site/`, validates the app with
+lint, focused FOREX tests, and `npm run build`, then uploads the generated Sites
+artifact. Pushes to `master` also create a GitHub production environment record
+for:
+
+```text
+https://aster-trading-terminal.yope-1704.chatgpt-team.site/
+```
+
+The live site is the existing OpenAI Sites project:
+
+```text
+appgprj_6a273edca0788191b65b1ab1d1373183
+```
+
+OpenAI Sites deployment credentials are managed by the Sites connector rather
+than committed repo secrets.
+
 ## D1 Migration
 
 The app declares the logical D1 binding in `.openai/hosting.json`:

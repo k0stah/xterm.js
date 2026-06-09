@@ -30,6 +30,10 @@ test-results/
 # Keep bundled code out of Git
 dist/
 demo/dist/
+!trading-terminal-site/build/
+!trading-terminal-site/build/**
+!trading-terminal-site/lib/
+!trading-terminal-site/lib/**
 
 # dont commit benchmark folders
 .benchmark/
